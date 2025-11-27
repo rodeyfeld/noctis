@@ -1,44 +1,32 @@
 services:
+  # Prefect metadata database
   postgres:
     image: postgres:14
+    env_file: .env
     environment:
-      POSTGRES_USER: prefect
-      POSTGRES_PASSWORD: prefect
-      POSTGRES_DB: prefect
+      POSTGRES_USER: ${PREFECT_DB_USER}
+      POSTGRES_PASSWORD: ${PREFECT_DB_PASSWORD}
+      POSTGRES_DB: ${PREFECT_DB_NAME}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U prefect"]
+      test: ["CMD-SHELL", "pg_isready -U ${PREFECT_DB_USER}"]
       interval: 5s
       timeout: 5s
       retries: 5
 
-  redis:
-    image: redis:7
-    volumes:
-      - redis_data:/data
-    healthcheck:
-      test: ["CMD-SHELL", "redis-cli ping"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-
+  # Prefect server (API + UI + background services)
   prefect-server:
     image: prefecthq/prefect:3-latest
     depends_on:
       postgres:
         condition: service_healthy
-      redis:
-        condition: service_healthy
+    env_file: .env
     environment:
-      PREFECT_API_DATABASE_CONNECTION_URL: postgresql+asyncpg://prefect:prefect@postgres:5432/prefect
+      PREFECT_API_DATABASE_CONNECTION_URL: postgresql+asyncpg://${PREFECT_DB_USER}:${PREFECT_DB_PASSWORD}@postgres:5432/${PREFECT_DB_NAME}
       PREFECT_SERVER_API_HOST: 0.0.0.0
-      PREFECT_MESSAGING_BROKER: prefect_redis.messaging
-      PREFECT_MESSAGING_CACHE: prefect_redis.messaging
-      PREFECT_REDIS_MESSAGING_HOST: redis
-      PREFECT_REDIS_MESSAGING_PORT: 6379
-      PREFECT_REDIS_MESSAGING_DB: 0
-    command: prefect server start --no-services
+      PREFECT_UI_API_URL: http://127.0.0.1:4200/api
+    command: prefect server start
     ports:
       - "4200:4200"
     healthcheck:
@@ -48,30 +36,30 @@ services:
       retries: 3
       start_period: 60s
 
-  prefect-services:
-    image: prefecthq/prefect:3-latest
-    depends_on:
-      prefect-server:
-        condition: service_healthy
-    environment:
-      PREFECT_API_DATABASE_CONNECTION_URL: postgresql+asyncpg://prefect:prefect@postgres:5432/prefect
-      PREFECT_MESSAGING_BROKER: prefect_redis.messaging
-      PREFECT_MESSAGING_CACHE: prefect_redis.messaging
-      PREFECT_REDIS_MESSAGING_HOST: redis
-      PREFECT_REDIS_MESSAGING_PORT: 6379
-      PREFECT_REDIS_MESSAGING_DB: 0
-    command: prefect server services start
-
+  # Prefect worker (executes flows)
   prefect-worker:
     image: prefecthq/prefect:3-latest
     depends_on:
       prefect-server:
         condition: service_healthy
+    env_file: .env
     environment:
       PREFECT_API_URL: http://prefect-server:4200/api
-    command: prefect worker start --pool local-pool
+    command: prefect worker start --pool noctis-pool
+    restart: on-failure
+
+  # Noctis flow server (registers and serves flows)
+  noctis:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      prefect-server:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      PREFECT_API_URL: http://prefect-server:4200/api
     restart: on-failure
 
 volumes:
   postgres_data:
-  redis_data:
