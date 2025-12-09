@@ -1,4 +1,8 @@
-FROM python:3.12-slim
+FROM python:3.12-slim AS base
+
+ENV PYTHONUNBUFFERED=1 \
+    UV_PROJECT_ENV=.venv \
+    PATH="/app/.venv/bin:${PATH}"
 
 WORKDIR /app
 
@@ -10,15 +14,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Install uv for fast dependency management
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
-# Copy project files
+FROM base AS builder
 COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev --no-install-project
+
 COPY flows/ ./flows/
 COPY utils/ ./utils/
 COPY main.py ./
-
-# Install dependencies
 RUN uv sync --frozen --no-dev
 
-# Run the flow server
+
+FROM base AS dev
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev --no-install-project
+COPY . .
 CMD ["uv", "run", "python", "main.py"]
 
+
+FROM base AS prod
+COPY --from=builder /app /app
+CMD ["uv", "run", "python", "main.py"]
