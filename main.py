@@ -24,9 +24,6 @@ def deploy_flows():
         name="default",
         description="Process ImageryFinder requests and create archive lookup items",
         tags=["study", "imagery-finder", "spatial"],
-        parameters={
-            "notify": True,
-        },
     )
     
     # Serve all deployments

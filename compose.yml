@@ -24,10 +24,6 @@ services:
       postgres:
         condition: service_healthy
     env_file: .env
-    environment:
-      PREFECT_API_DATABASE_CONNECTION_URL: postgresql+asyncpg://${PREFECT_DB_USER}:${PREFECT_DB_PASSWORD}@postgres:5432/${PREFECT_DB_NAME}
-      PREFECT_SERVER_API_HOST: 0.0.0.0
-      PREFECT_UI_API_URL: http://127.0.0.1:4200/api
     command: prefect server start
     ports:
       - "4200:4200"
@@ -39,6 +35,7 @@ services:
       start_period: 60s
     networks:
       - noctis-net
+      - augur-net
 
   # Prefect worker (executes flows)
   prefect-worker:
@@ -47,8 +44,6 @@ services:
       prefect-server:
         condition: service_healthy
     env_file: .env
-    environment:
-      PREFECT_API_URL: http://prefect-server:4200/api
     command: prefect worker start --pool noctis-pool
     restart: on-failure
     networks:
@@ -64,8 +59,6 @@ services:
       prefect-server:
         condition: service_healthy
     env_file: .env
-    environment:
-      PREFECT_API_URL: http://prefect-server:4200/api
     volumes:
       - .:/app
     restart: on-failure
@@ -75,6 +68,7 @@ services:
 
 volumes:
   postgres_data:
+  duckdb_data:
 
 networks:
   noctis-net:

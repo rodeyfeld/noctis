@@ -1,12 +1,11 @@
 """
 Archive Finder Study Flow (Imagery Finder)
 
-Migrated from Airflow DAG: imagery_finder_dag.py
-
 This flow processes ImageryFinder requests by:
 1. Finding archive items that match the imagery finder's spatial and temporal criteria
 2. Creating ArchiveLookupItem records linking matched items to the study
-3. Notifying the Augur API to continue the divination process
+3. Transforming raw lookup items into normalized ArchiveLookupResult records
+4. Updating the Dream status to COMPLETE
 
 Uses asyncpg for high-performance PostgreSQL operations with PostGIS.
 """
@@ -14,7 +13,6 @@ Uses asyncpg for high-performance PostgreSQL operations with PostGIS.
 import os
 from typing import Any
 
-import httpx
 from prefect import flow, task, get_run_logger
 
 from utils import get_atlas_connector
@@ -22,11 +20,55 @@ from utils import get_atlas_connector
 
 # --- Configuration ---
 
-AUGUR_API_URL = os.environ.get("NOCTIS_AUGUR_API_URL", "http://localhost:8000")
-AUGUR_DIVINE_ENDPOINT = "/api/augury/divine"
+# Dream status constants (matching Django model)
+DREAM_STATUS_PROCESSING = "PROCESSING"
+DREAM_STATUS_COMPLETE = "COMPLETE"
+DREAM_STATUS_FAILED = "FAILED"
 
 
 # --- Tasks ---
+
+@task(
+    name="get_imagery_finder_info",
+    tags=["postgres"],
+)
+async def get_imagery_finder_info(imagery_finder_pk: int) -> dict[str, Any]:
+    """
+    Fetch imagery finder details for logging and validation.
+    
+    Args:
+        imagery_finder_pk: Primary key of the ImageryFinder
+    
+    Returns:
+        Dict with imagery finder details
+    """
+    logger = get_run_logger()
+    
+    async with get_atlas_connector() as atlas:
+        row = await atlas.fetchrow(
+            """
+            SELECT 
+                if.id,
+                if.name,
+                if.start_date,
+                if.end_date,
+                if.is_active,
+                l.name as location_name,
+                ST_AsText(l.geometry) as geometry_wkt
+            FROM imagery_finder_imageryfinder if
+            LEFT JOIN core_location l ON if.location_id = l.id
+            WHERE if.id = $1
+            """,
+            imagery_finder_pk,
+        )
+        
+        if row is None:
+            raise ValueError(f"ImageryFinder {imagery_finder_pk} not found")
+        
+        info = dict(row)
+        logger.info(f"Processing ImageryFinder: {info['name']} ({info['id']})")
+        return info
+
 
 @task(
     name="create_imagery_finder_items",
@@ -131,105 +173,224 @@ async def create_imagery_finder_items(
 
 
 @task(
-    name="notify_augur",
-    retries=3,
-    retry_delay_seconds=10,
-    tags=["http", "augur"],
+    name="transform_lookup_results",
+    retries=2,
+    retry_delay_seconds=30,
+    tags=["postgres", "transform"],
 )
-async def notify_augur(dream_pk: int) -> dict[str, Any]:
+async def transform_lookup_results(dream_pk: int) -> int:
     """
-    Notify the Augur API that the imagery finder processing is complete.
+    Transform raw ArchiveLookupItems into normalized ArchiveLookupResult records.
     
-    This triggers the divination process to continue with the matched results.
+    This task performs the "divination" step:
+    1. Gets all ArchiveLookupItems for the study
+    2. For each item, gets or creates Provider, Collection, Sensor records
+    3. Creates ArchiveLookupResult records with proper FK relationships
     
     Args:
         dream_pk: Primary key of the Dream
     
     Returns:
-        Response from the Augur API
+        Number of results created
     """
     logger = get_run_logger()
     
-    url = f"{AUGUR_API_URL}{AUGUR_DIVINE_ENDPOINT}"
-    payload = {"dream_id": dream_pk}
+    logger.info(f"Transforming lookup results for dream {dream_pk}")
     
-    logger.info(f"Notifying Augur at {url} for dream {dream_pk}")
-    
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.post(url, json=payload)
-        response.raise_for_status()
+    async with get_atlas_connector() as atlas:
+        # Get the study_id from the dream
+        study_id = await atlas.fetchval(
+            "SELECT study_id FROM augury_dream WHERE id = $1",
+            dream_pk,
+        )
         
-        result = response.json()
-        logger.info(f"Augur notification successful: {result}")
-        return result
+        if study_id is None:
+            logger.error(f"No study found for dream {dream_pk}")
+            raise ValueError(f"Dream {dream_pk} has no associated study")
+        
+        # Get all lookup items with their archive item details
+        lookup_items = await atlas.fetch(
+            """
+            SELECT 
+                ali.id as lookup_item_id,
+                ai.external_id,
+                ai.collection,
+                ai.provider,
+                ai.start_date,
+                ai.end_date,
+                ai.sensor,
+                ai.geometry,
+                ai.thumbnail,
+                ai.metadata
+            FROM imagery_finder_archivelookupitem ali
+            JOIN imagery_finder_archiveitem ai ON ali.archive_item_id = ai.id
+            WHERE ali.study_id = $1
+            """,
+            study_id,
+        )
+        
+        if not lookup_items:
+            logger.info(f"No lookup items found for study {study_id}")
+            return 0
+        
+        logger.info(f"Transforming {len(lookup_items)} lookup items")
+        
+        # Cache for providers, collections, and sensors to minimize queries
+        provider_cache: dict[str, int] = {}
+        collection_cache: dict[tuple[str, int], int] = {}
+        sensor_cache: dict[str, int] = {}
+        
+        results_created = 0
+        
+        for item in lookup_items:
+            provider_name = item["provider"] or "Unknown"
+            collection_name = item["collection"] or "Unknown"
+            sensor_name = item["sensor"] or "Unknown"
+            
+            # Get or create Provider
+            if provider_name not in provider_cache:
+                provider_id = await atlas.fetchval(
+                    "SELECT id FROM provider_provider WHERE name = $1",
+                    provider_name,
+                )
+                if provider_id is None:
+                    provider_id = await atlas.fetchval(
+                        """
+                        INSERT INTO provider_provider (created, modified, name, is_active)
+                        VALUES (NOW(), NOW(), $1, true)
+                        RETURNING id
+                        """,
+                        provider_name,
+                    )
+                provider_cache[provider_name] = provider_id
+            
+            provider_id = provider_cache[provider_name]
+            
+            # Get or create Collection (scoped to provider)
+            collection_key = (collection_name, provider_id)
+            if collection_key not in collection_cache:
+                collection_id = await atlas.fetchval(
+                    "SELECT id FROM provider_collection WHERE name = $1 AND provider_id = $2",
+                    collection_name,
+                    provider_id,
+                )
+                if collection_id is None:
+                    collection_id = await atlas.fetchval(
+                        """
+                        INSERT INTO provider_collection (created, modified, name, provider_id)
+                        VALUES (NOW(), NOW(), $1, $2)
+                        RETURNING id
+                        """,
+                        collection_name,
+                        provider_id,
+                    )
+                collection_cache[collection_key] = collection_id
+            
+            collection_id = collection_cache[collection_key]
+            
+            # Get or create Sensor
+            if sensor_name not in sensor_cache:
+                sensor_id = await atlas.fetchval(
+                    "SELECT id FROM core_sensor WHERE name = $1",
+                    sensor_name,
+                )
+                if sensor_id is None:
+                    # Determine technique based on sensor name
+                    technique = "UNKNOWN"
+                    if sensor_name in ("EO", "MSI"):
+                        technique = "EO"
+                    elif sensor_name == "SAR":
+                        technique = "SAR"
+                    
+                    sensor_id = await atlas.fetchval(
+                        """
+                        INSERT INTO core_sensor (created, modified, name, technique)
+                        VALUES (NOW(), NOW(), $1, $2)
+                        RETURNING id
+                        """,
+                        sensor_name,
+                        technique,
+                    )
+                sensor_cache[sensor_name] = sensor_id
+            
+            sensor_id = sensor_cache[sensor_name]
+            
+            # Create ArchiveLookupResult
+            await atlas.execute(
+                """
+                INSERT INTO imagery_finder_archivelookupresult 
+                    (created, modified, study_id, external_id, collection_id, 
+                     start_date, end_date, sensor_id, geometry, thumbnail, metadata)
+                VALUES (NOW(), NOW(), $1, $2, $3, $4, $5, $6, $7, $8, $9)
+                ON CONFLICT DO NOTHING
+                """,
+                study_id,
+                item["external_id"] or "",
+                collection_id,
+                item["start_date"],
+                item["end_date"],
+                sensor_id,
+                item["geometry"],
+                item["thumbnail"] or "",
+                item["metadata"] or "",
+            )
+            results_created += 1
+        
+        logger.info(f"Created {results_created} archive lookup results for study {study_id}")
+        return results_created
 
 
 @task(
-    name="get_imagery_finder_info",
+    name="update_dream_status",
     tags=["postgres"],
 )
-async def get_imagery_finder_info(imagery_finder_pk: int) -> dict[str, Any]:
+async def update_dream_status(dream_pk: int, status: str) -> None:
     """
-    Fetch imagery finder details for logging and validation.
+    Update the Dream status in the database.
     
     Args:
-        imagery_finder_pk: Primary key of the ImageryFinder
-    
-    Returns:
-        Dict with imagery finder details
+        dream_pk: Primary key of the Dream
+        status: New status value (e.g., "COMPLETE", "FAILED")
     """
     logger = get_run_logger()
     
+    logger.info(f"Updating dream {dream_pk} status to {status}")
+    
     async with get_atlas_connector() as atlas:
-        row = await atlas.fetchrow(
-            """
-            SELECT 
-                if.id,
-                if.name,
-                if.start_date,
-                if.end_date,
-                if.is_active,
-                l.name as location_name,
-                ST_AsText(l.geometry) as geometry_wkt
-            FROM imagery_finder_imageryfinder if
-            LEFT JOIN core_location l ON if.location_id = l.id
-            WHERE if.id = $1
-            """,
-            imagery_finder_pk,
+        await atlas.execute(
+            "UPDATE augury_dream SET status = $1, modified = NOW() WHERE id = $2",
+            status,
+            dream_pk,
         )
-        
-        if row is None:
-            raise ValueError(f"ImageryFinder {imagery_finder_pk} not found")
-        
-        info = dict(row)
-        logger.info(f"Processing ImageryFinder: {info['name']} ({info['id']})")
-        return info
+    
+    logger.info(f"Dream {dream_pk} status updated to {status}")
 
 
 # --- Main Flow ---
 
 @flow(
     name="imagery-finder-study",
-    description="Process ImageryFinder requests and create archive lookup items",
+    description="Process ImageryFinder requests, create archive lookup items, and transform results",
     retries=1,
     retry_delay_seconds=60,
 )
 async def imagery_finder_study(
     imagery_finder_pk: int,
     dream_pk: int,
-    notify: bool = True,
 ) -> dict[str, Any]:
     """
     Main flow: Process an ImageryFinder study.
     
-    This flow finds archive items matching the imagery finder's criteria
-    (spatial intersection and temporal overlap), creates lookup items,
-    and notifies the Augur API to continue processing.
+    This flow:
+    1. Validates the ImageryFinder exists and logs its details
+    2. Finds archive items matching spatial/temporal criteria
+    3. Creates ArchiveLookupItem records
+    4. Transforms items into normalized ArchiveLookupResult records
+    5. Updates Dream status to COMPLETE
     
     Args:
         imagery_finder_pk: Primary key of the ImageryFinder to process
         dream_pk: Primary key of the Dream (study execution context)
-        notify: Whether to notify Augur API after processing (default: True)
     
     Returns:
         Summary dict with processing results
@@ -241,36 +402,46 @@ async def imagery_finder_study(
         f"imagery_finder={imagery_finder_pk}, dream={dream_pk}"
     )
     
-    # Get imagery finder info for validation and logging
-    imagery_finder_info = await get_imagery_finder_info(imagery_finder_pk)
-    
-    if not imagery_finder_info.get("is_active", False):
-        logger.warning(f"ImageryFinder {imagery_finder_pk} is not active")
-    
-    # Create archive lookup items
-    items_created = await create_imagery_finder_items(
-        imagery_finder_pk=imagery_finder_pk,
-        dream_pk=dream_pk,
-    )
-    
-    # Notify Augur to continue processing
-    augur_response = None
-    if notify and items_created > 0:
-        augur_response = await notify_augur(dream_pk)
-    elif notify:
-        logger.info("Skipping Augur notification - no items created")
-    
-    summary = {
-        "imagery_finder_pk": imagery_finder_pk,
-        "imagery_finder_name": imagery_finder_info.get("name"),
-        "dream_pk": dream_pk,
-        "items_created": items_created,
-        "augur_notified": augur_response is not None,
-        "augur_response": augur_response,
-    }
-    
-    logger.info(f"Imagery finder study complete: {summary}")
-    return summary
+    try:
+        # Step 1: Get imagery finder info for validation and logging
+        imagery_finder_info = await get_imagery_finder_info(imagery_finder_pk)
+        
+        if not imagery_finder_info.get("is_active", False):
+            logger.warning(f"ImageryFinder {imagery_finder_pk} is not active")
+        
+        # Step 2: Create archive lookup items (spatial query)
+        items_created = await create_imagery_finder_items(
+            imagery_finder_pk=imagery_finder_pk,
+            dream_pk=dream_pk,
+        )
+        
+        # Step 3: Transform lookup items into normalized results
+        results_created = 0
+        if items_created > 0:
+            results_created = await transform_lookup_results(dream_pk)
+        else:
+            logger.info("Skipping transformation - no items to transform")
+        
+        # Step 4: Mark dream as complete
+        await update_dream_status(dream_pk, DREAM_STATUS_COMPLETE)
+        
+        summary = {
+            "imagery_finder_pk": imagery_finder_pk,
+            "imagery_finder_name": imagery_finder_info.get("name"),
+            "dream_pk": dream_pk,
+            "items_created": items_created,
+            "results_created": results_created,
+            "status": DREAM_STATUS_COMPLETE,
+        }
+        
+        logger.info(f"Imagery finder study complete: {summary}")
+        return summary
+        
+    except Exception as e:
+        logger.error(f"Flow failed: {e}")
+        # Mark dream as failed
+        await update_dream_status(dream_pk, DREAM_STATUS_FAILED)
+        raise
 
 
 # --- Deployment Entry Point ---
@@ -283,7 +454,5 @@ if __name__ == "__main__":
         imagery_finder_study(
             imagery_finder_pk=2,
             dream_pk=1,
-            notify=False,  # Disable notification for local testing
         )
     )
-
