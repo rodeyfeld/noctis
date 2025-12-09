@@ -1,0 +1,27 @@
+variables:
+  - &docker_creds
+    username:
+      from_secret: docker_username
+    password:
+      from_secret: docker_password
+
+steps:
+  build:
+    image: woodpeckerci/plugin-docker-buildx
+    settings:
+      repo: edrodefeld/noctis
+      target: prod
+      auto_tag: true
+      <<: *docker_creds
+    when:
+      - event: [push, manual]
+        branch: main
+
+  deploy:
+    image: bitnami/kubectl
+    commands:
+      # Secrets are synced centrally via mirage pipeline
+      - kubectl rollout restart deployment/noctis -n galaxy
+    when:
+      - event: [push, manual]
+        branch: main
