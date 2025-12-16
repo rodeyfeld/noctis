@@ -159,8 +159,6 @@ async def create_imagery_finder_items(
                 archive_item_id,
                 $1 as study_id
             FROM {temp_table_name}
-            ON CONFLICT (imagery_finder_id, archive_item_id, study_id) 
-            DO UPDATE SET modified = NOW()
         """
         
         await atlas.execute(insert_sql, study_id)
