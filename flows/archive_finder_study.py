@@ -293,12 +293,14 @@ async def transform_lookup_results(dream_pk: int) -> int:
                     sensor_name,
                 )
                 if sensor_id is None:
-                    # Determine technique based on sensor name
-                    technique = "UNKNOWN"
-                    if sensor_name in ("EO", "MSI"):
+                    # Determine technique based on sensor name (case-insensitive)
+                    sensor_upper = sensor_name.upper()
+                    if sensor_upper in ("EO", "MSI"):
                         technique = "EO"
-                    elif sensor_name == "SAR":
+                    elif sensor_upper == "SAR":
                         technique = "SAR"
+                    else:
+                        technique = "UNKNOWN"
                     
                     sensor_id = await atlas.fetchval(
                         """
