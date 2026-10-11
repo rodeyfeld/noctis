@@ -9,7 +9,8 @@ steps:
   build:
     image: woodpeckerci/plugin-docker-buildx
     settings:
-      repo: edrodefeld/noctis
+      registry: schematics.pinwheel.fan
+      repo: schematics.pinwheel.fan/rodeyfeld/noctis
       target: prod
       auto_tag: true
       <<: *docker_creds
