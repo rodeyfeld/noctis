@@ -22,13 +22,33 @@ prefect deployment run 'imagery-finder-study/default' \
   --param dream_pk=1
 ```
 
+### sentinel-sync
+
+Daily pull of new Sentinel-1/2/3/6 scenes from the [Copernicus STAC API](https://stac.dataspace.copernicus.eu/v1) into `imagery_finder_archiveitem`. Oracle does the big historical backfill; this keeps it current.
+
+- **Schedule**: `sentinel-sync/daily` at 02:00 UTC
+- **Window**: scenes acquired in the `lookback_days` (default 3) days before `target_date` (default: the scheduled run date). The lookback catches products Copernicus publishes late (Sentinel-3 NTC lands a day or more after acquisition).
+- **Idempotent**: scenes whose `external_id` already exists for the Copernicus provider are skipped, so re-runs and overlapping windows never duplicate rows. Each page commits on its own, so a retried task picks up where it left off.
+
+```bash
+# Backfill a specific day
+prefect deployment run 'sentinel-sync/daily' \
+  --param target_date=2026-10-01 \
+  --param lookback_days=1
+
+# Just one collection
+prefect deployment run 'sentinel-sync/daily' \
+  --param collections='["sentinel-2-l2a"]'
+```
+
 ## Architecture
 
 ```
 noctis/
 ├── flows/
 │   ├── __init__.py
-│   └── archive_finder_study.py   # Spatial archive matching
+│   ├── archive_finder_study.py   # Spatial archive matching
+│   └── sentinel_sync.py          # Daily Copernicus STAC pull
 ├── utils/
 │   ├── __init__.py
 │   └── atlas_connector.py        # asyncpg + connectorx utilities
