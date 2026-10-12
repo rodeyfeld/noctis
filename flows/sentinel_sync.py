@@ -1,7 +1,8 @@
 """
 Sentinel Sync Flow
 
-Daily pull of new Sentinel scenes from the Copernicus STAC API into Atlas.
+Daily pull of new Sentinel scenes from the Copernicus STAC API into the
+sentinel archive database (ephemeris).
 
 This flow:
 1. Searches each Sentinel collection for scenes acquired in a rolling window
@@ -25,7 +26,7 @@ import httpx
 from prefect import flow, get_run_logger, task
 from prefect.runtime import flow_run
 
-from utils import get_atlas_connector
+from utils import get_ephemeris_connector
 
 # --- Configuration ---
 
@@ -258,7 +259,7 @@ async def sync_sentinel_collection(
 
     async with (
         httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client,
-        get_atlas_connector() as atlas,
+        get_ephemeris_connector() as ephemeris,
     ):
         url: str | None = STAC_SEARCH_URL
         while url:
@@ -272,7 +273,7 @@ async def sync_sentinel_collection(
 
             if rows:
                 columns = list(zip(*rows))
-                async with atlas.transaction() as conn:
+                async with ephemeris.transaction() as conn:
                     # Serialize writers per collection so overlapping runs can't
                     # both pass the NOT EXISTS check for the same scene
                     await conn.execute(
@@ -312,7 +313,7 @@ async def sync_sentinel_collection(
 
 @flow(
     name="sentinel-sync",
-    description="Daily idempotent pull of Sentinel scenes from Copernicus STAC into Atlas",
+    description="Daily idempotent pull of Sentinel scenes from Copernicus STAC into ephemeris",
 )
 async def sentinel_sync(
     target_date: date | None = None,

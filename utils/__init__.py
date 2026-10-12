@@ -5,6 +5,7 @@ from utils.atlas_connector import (
     AtlasConnector,
     get_atlas_connector,
     get_connector,
+    get_ephemeris_connector,
 )
 
 __all__ = [
@@ -12,5 +13,6 @@ __all__ = [
     "AtlasConnector",
     "get_atlas_connector",
     "get_connector",
+    "get_ephemeris_connector",
 ]
 

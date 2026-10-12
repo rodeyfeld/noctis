@@ -9,11 +9,11 @@ Prefect workflow orchestration for the Universe ecosystem.
 Processes ImageryFinder requests by matching archive items using PostGIS spatial queries.
 
 - **Input**: `imagery_finder_pk` and `dream_pk` parameters
-- **Process**: 
-  1. Spatial intersection query (ST_Intersects) between archive items and finder location
-  2. Temporal filtering based on finder date range
-  3. Creates `ArchiveLookupItem` records linking matches to the study
-  4. Notifies Augur API to continue divination process
+- **Process**:
+  1. Reads the finder's location and date range from Atlas
+  2. Finds archive items in ephemeris that intersect the location (ST_Intersects) within the dates, at most 50,000, most recent first
+  3. Writes `ArchiveLookupItem` and `ArchiveLookupResult` records to Atlas in one transaction, replacing any the study already had
+  4. Marks the Dream `COMPLETE`
 
 ```bash
 # Run via CLI
@@ -24,7 +24,7 @@ prefect deployment run 'imagery-finder-study/default' \
 
 ### sentinel-sync
 
-Daily pull of new Sentinel-1/2/3/6 scenes from the [Copernicus STAC API](https://stac.dataspace.copernicus.eu/v1) into `imagery_finder_archiveitem`. Oracle does the big historical backfill; this keeps it current.
+Daily pull of new Sentinel-1/2/3/6 scenes from the [Copernicus STAC API](https://stac.dataspace.copernicus.eu/v1) into `imagery_finder_archiveitem` in ephemeris. `sentinel-backfill` fills in the past; this keeps it current.
 
 - **Schedule**: `sentinel-sync/daily` at 02:00 UTC
 - **Window**: scenes acquired in the `lookback_days` (default 3) days before `target_date` (default: the scheduled run date). The lookback catches products Copernicus publishes late (Sentinel-3 NTC lands a day or more after acquisition).
@@ -41,6 +41,23 @@ prefect deployment run 'sentinel-sync/daily' \
   --param collections='["sentinel-2-l2a"]'
 ```
 
+### sentinel-backfill
+
+Fills ephemeris with past scenes, newest first, using sentinel-sync's task one window at a time. Not scheduled; start it from the Prefect UI or CLI.
+
+- **Range**: from `before` (default today) back to `until` (default 2014-04-01, Sentinel-1A) in `window_days` (default 7) windows
+- **Size cap**: stops before ephemeris passes `max_database_gb` (default 40, on a 48Gi volume), so the oldest scenes are what's left out
+- **Rerunnable**: inserts skip stored scenes; a failed window is skipped and listed when the run ends, and a rerun fills it. To resume a stopped run, pass the `reached` date from its summary as `before`.
+
+```bash
+prefect deployment run 'sentinel-backfill/manual'
+
+# Only Sentinel-1 and Sentinel-2 L2A, back to 2020
+prefect deployment run 'sentinel-backfill/manual' \
+  --param collections='["sentinel-1-grd", "sentinel-1-slc", "sentinel-2-l2a"]' \
+  --param until=2020-01-01
+```
+
 ## Architecture
 
 ```
@@ -48,6 +65,7 @@ noctis/
 ├── flows/
 │   ├── __init__.py
 │   ├── archive_finder_study.py   # Spatial archive matching
+│   ├── sentinel_backfill.py      # Past Copernicus scenes, newest first
 │   └── sentinel_sync.py          # Daily Copernicus STAC pull
 ├── utils/
 │   ├── __init__.py
@@ -58,6 +76,8 @@ noctis/
 ```
 
 ### Database Connectivity
+
+Two PostGIS databases: **Atlas** (augur's tables: finders, studies, results) and **ephemeris** (the sentinel archive, `imagery_finder_archiveitem`). The archive is kept apart so scrapes and archive scans can't slow augur down. Flows never join across them: the study flow reads matches out of ephemeris and writes them into Atlas.
 
 - **asyncpg**: Async PostgreSQL driver for high-performance writes and spatial queries
 - **connectorx**: Fast bulk reads into Polars DataFrames (when needed)
@@ -93,6 +113,11 @@ Copy `example.env` to `.env` and configure:
 | `ATLAS_DB_NAME` | Database name | `augur` |
 | `ATLAS_DB_USER` | Database user | `atlas_user` |
 | `ATLAS_DB_PASSWORD` | Database password | `atlas_password` |
+| `EPHEMERIS_DB_HOST` | Sentinel archive host; unset keeps the archive in Atlas | (unset) |
+| `EPHEMERIS_DB_PORT` | Sentinel archive port | `ATLAS_DB_PORT` |
+| `EPHEMERIS_DB_NAME` | Sentinel archive database | `ephemeris` |
+| `EPHEMERIS_DB_USER` | Sentinel archive user | `ATLAS_DB_USER` |
+| `EPHEMERIS_DB_PASSWORD` | Sentinel archive password | `ATLAS_DB_PASSWORD` |
 | `NOCTIS_AUGUR_API_URL` | Augur API base URL | `http://augur:8000` |
 
 ## Docker Compose Services

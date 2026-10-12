@@ -38,6 +38,25 @@ class AtlasConfig:
         )
 
     @classmethod
+    def ephemeris_from_env(cls) -> "AtlasConfig":
+        """
+        Load the sentinel archive (ephemeris) database's configuration.
+
+        Without EPHEMERIS_DB_HOST the archive stays in Atlas (local dev), and any
+        EPHEMERIS_DB_* not set falls back to the matching ATLAS_DB_* value.
+        """
+        atlas = cls.from_env()
+        if not os.environ.get("EPHEMERIS_DB_HOST"):
+            return atlas
+        return cls(
+            host=os.environ["EPHEMERIS_DB_HOST"],
+            port=int(os.environ.get("EPHEMERIS_DB_PORT", atlas.port)),
+            database=os.environ.get("EPHEMERIS_DB_NAME", "ephemeris"),
+            user=os.environ.get("EPHEMERIS_DB_USER", atlas.user),
+            password=os.environ.get("EPHEMERIS_DB_PASSWORD", atlas.password),
+        )
+
+    @classmethod
     async def from_prefect_secret(cls, secret_name: str = "atlas-db-config") -> "AtlasConfig":
         """Load configuration from Prefect Secret block."""
         try:
@@ -163,6 +182,22 @@ async def get_atlas_connector():
     """
     config = AtlasConfig.from_env()
     connector = AtlasConnector(config)
+    try:
+        await connector.create_pool()
+        yield connector
+    finally:
+        await connector.close_pool()
+
+
+@asynccontextmanager
+async def get_ephemeris_connector():
+    """
+    Context manager for the sentinel archive database (ephemeris).
+
+    imagery_finder_archiveitem lives here, apart from Atlas, so scrapes and archive
+    queries can't load augur's own tables. Same interface as get_atlas_connector.
+    """
+    connector = AtlasConnector(AtlasConfig.ephemeris_from_env())
     try:
         await connector.create_pool()
         yield connector
